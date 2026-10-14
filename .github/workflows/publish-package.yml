@@ -6,7 +6,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write # npm provenance 需要 OIDC
 
 jobs:
   publish:

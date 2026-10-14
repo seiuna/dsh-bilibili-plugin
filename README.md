@@ -172,28 +172,39 @@ pnpm install --frozen-lockfile
 npm publish --dry-run   # 打印 tarball 清单，并触发 prepublishOnly
 ```
 
-### 2. 凭据配置（二选一）
+### 2. 配置 npm token（NPM_TOKEN）
 
-**方式 A：npm Trusted Publisher（推荐，无长期 token）**
+发布工作流使用仓库 secret `NPM_TOKEN`（`NODE_AUTH_TOKEN` 在发布步骤注入）。生成本文以下步骤：
 
-在 npm 包页面 → Settings → Trusted Publisher 填：Publisher 选 GitHub Actions，Organization/user 填 `seiuna`，Repository 填 `dsh-bilibili-plugin`，Workflow 填 `publish-package.yml`，Environment 留空。之后 Actions 通过 OIDC 直接换发短期凭据，仓库里不存任何 secret。
+1. 打开 https://www.npmjs.com/settings/~/tokens → **Generate New Token** → **Granular Access Token**。
+2. Token name 填 `dsh-bilibili-plugin-github-actions`；Expiration 按需（最长 90 天，到期需重新生成并更新 secret）。
+3. Packages and scopes 权限：**Read and write**。首次发布时包尚未存在，选 “All packages” 或允许该账号新建包；若只授权单个包，需等包创建后再改。
+4. Organizations 权限无需勾选；不要勾 “read-only”。
+5. 生成后 token 只显示一次，立即复制。
+6. 写入 GitHub 仓库 secret（名称必须是 `NPM_TOKEN`，作用域 Repository，不要放到 Environment 里，否则工作流读不到）：
 
-**方式 B：Granular Access Token**
-
-npm 生成 Automation 类型 token（权限 `Read and write`）→ GitHub 仓库 Settings → Secrets and variables → Actions → New repository secret，名称 `NPM_TOKEN`；然后在 `.github/workflows/publish-package.yml` 的发布步骤加上：
-
-```yaml
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+```powershell
+gh secret set NPM_TOKEN --repo seiuna/dsh-bilibili-plugin
+# 交互式粘贴 token；或非交互：gh secret set NPM_TOKEN --repo seiuna/dsh-bilibili-plugin --body "npm_xxx"
 ```
+
+也可以网页操作：仓库 → Settings → Secrets and variables → Actions → **New repository secret** → Name `NPM_TOKEN`、Secret 粘贴 token。
+
+核验：
+
+```powershell
+gh secret list --repo seiuna/dsh-bilibili-plugin   # 应列出 NPM_TOKEN
+```
+
+`setup-node` 的 `registry-url` 会把 token 写进 runner 的 `.npmrc`（`//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`），配合工作流的 `NPM_CONFIG_REGISTRY` 保证认证与推送都走官方源。
 
 ### 3. Actions 工作流
 
 | 文件 | 触发 | 作用 |
 | :--- | :--- | :--- |
 | `.github/workflows/ci.yml` | push/PR 到 `main` | 冻结锁文件安装 → typecheck → 全量测试 → 构建 → `npm pack --dry-run` 校验发布清单，并上传 `lib/` 产物 |
-| `.github/workflows/publish-package.yml` | GitHub Release `published`；也可手动 `workflow_dispatch` 走 dry-run | 校验 tag 与 `package.json` 版本一致 → 构建 → `npm publish --access public --provenance` |
-| `.github/workflows/release-drafter.yml` | push 到 `main` | 自动维护 Release 草稿 |
+| `.github/workflows/publish-package.yml` | **仅 GitHub Release `published`** | 校验 tag 与 `package.json` 版本一致 → 构建 → `npm publish --access public` |
+| `.github/workflows/release-drafter.yml` | push 到 `main` | 按 `.github/release-drafter.yml` 模板自动维护 Release 草稿 |
 
 工作流里有三个容易踩的坑，已在配置中处理：
 
@@ -212,11 +223,14 @@ git push origin main --follow-tags
 
 然后在 GitHub 上把 Release Drafter 的草稿标题改成 `vX.Y.Z` 并发布（Publish release）。Release 一旦 published，publish 工作流自动执行；发布成功后可用 `npm view dsh-bilibili-plugin version` 与 `npm view dsh-bilibili-plugin dist.integrity` 核对。
 
-### 5. 当前未完成的部分
+### 5. 当前状态与未验证部分
 
-- 仓库目前是 **private**，且还没有远端分支与 Release：Actions 需要先把 `main` 推上去才会运行；Release Drafter 的 `push: main` 触发同样依赖远端 `main`。
+- `main` 已推送到 `origin`（commit `3f1db86`），CI 与 Release Drafter 首次运行均通过（2026-10-14）；Release Drafter 已生成 `v0.1.0` 草稿。
+- 仓库目前是 **private**：对本仓库而言 Actions 不受影响，但对外分发前需要改为 public，否则别人无法 `pnpm add`。
+- 尚未配置 `NPM_TOKEN`（`gh secret list` 为空）；发布工作流虽然已就位，但**真实 Release 发布尚未跑过一次**，不能视为已验证。
 - `@deepseek-ai/*`（cordis、dsh-tools、dsh-session 等）是运行时由 DSH 宿主提供的 peer 依赖，不在 npm 公共源上，因此 `peerDependenciesMeta` 全部标为 optional，消费方无需也无法单独安装；CI 只做类型检查与离线测试，不代表真实 DSH 端到端加载通过。
-- `npm publish --dry-run` 仅验证了本机清单与 `prepublishOnly` 全通过；真实发布与 Actions 运行结果尚未验证。
+- 本机只验证了 `npm publish --dry-run` 的清单与 `prepublishOnly` 全通过。
+- 本地真实账户 profile（`profiles/`，含 cookie / refreshToken）已加入 `.gitignore`，未入库；该文件曾存在于工作区，若担心泄露请在 B站重新登录使旧凭据失效。
 
 ---
 
