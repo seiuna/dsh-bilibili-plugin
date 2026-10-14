@@ -1,8 +1,10 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
+import { errorMessage } from './request.js';
+import { startQrcodeSession } from './qrcode-session.js';
+import { createLatestRequest } from './async.js';
 import { useBiliStore, biliStore } from './store.js';
 import {
-  generateQrcode,
-  pollQrcode,
   setupVaultPassword,
   unlockVault,
   logoutVault,
@@ -13,14 +15,13 @@ import type { BiliUserInfo } from '../types.js';
 type ViewMode = 'auto' | 'qrcode' | 'setup_pwd' | 'unlock';
 
 export function BilibiliAuthOverlay() {
-  const { isOpen, status } = useBiliStore();
+  const { isOpen, status, error: authError } = useBiliStore();
 
   const [viewMode, setViewMode] = useState<ViewMode>('auto');
 
   // QR Code State
   const [qrcodeDataUrl, setQrcodeDataUrl] = useState('');
-  const [qrcodeKey, setQrcodeKey] = useState('');
-  const [qrStatus, setQrStatus] = useState<'waiting' | 'scanned' | 'expired' | 'loading'>('loading');
+  const [qrStatus, setQrStatus] = useState<'waiting' | 'scanned' | 'expired' | 'loading' | 'error'>('loading');
   const [statusMsg, setStatusMsg] = useState('正在申请登录二维码...');
 
   // Setup Password State (Post-Scan)
@@ -38,14 +39,16 @@ export function BilibiliAuthOverlay() {
   const [unlockError, setUnlockError] = useState('');
   const [isUnlocking, setIsUnlocking] = useState(false);
 
-  const pollTimerRef = useRef<any>(null);
+  const [logoutError, setLogoutError] = useState('');
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const stopQrcodeRef = useRef<(() => void) | null>(null);
+  const actions = useRef(createLatestRequest());
+  const actionBusy = useRef(false);
 
-  const clearTimer = () => {
-    if (pollTimerRef.current) {
-      clearInterval(pollTimerRef.current);
-      pollTimerRef.current = null;
-    }
-  };
+  const stopQrcode = useCallback(() => {
+    stopQrcodeRef.current?.();
+    stopQrcodeRef.current = null;
+  }, []);
 
   // Determine actual view
   const currentView = (() => {
@@ -55,76 +58,77 @@ export function BilibiliAuthOverlay() {
     return 'qrcode';
   })();
 
-  // Trigger QR Code generation
-  const startQrcode = async () => {
-    clearTimer();
+  const startQrcode = useCallback(() => {
+    stopQrcode();
+    setQrcodeDataUrl('');
     setQrStatus('loading');
     setStatusMsg('正在申请登录二维码...');
-    try {
-      const res = await generateQrcode();
-      setQrcodeDataUrl(res.qrcodeDataUrl);
-      setQrcodeKey(res.qrcodeKey);
-      setQrStatus('waiting');
-      setStatusMsg('请使用哔哩哔哩 App 扫一扫登录');
-
-      // Start polling
-      pollTimerRef.current = setInterval(async () => {
-        try {
-          const poll = await pollQrcode(res.qrcodeKey);
-          // status code reference from bilibili api and doucment
-          if (poll.code === 86101) {
-            setQrStatus('waiting');
-            setStatusMsg('请使用哔哩哔哩 App 扫一扫登录');
-          } else if (poll.code === 86090) {
-            setQrStatus('scanned');
-            setStatusMsg('已扫码！请在手机客户端点击【确认登录】');
-          } else if (poll.code === 86038) {
-            setQrStatus('expired');
-            setStatusMsg('二维码已失效，请点击刷新');
-            clearTimer();
-          } else if (poll.code === 0 && poll.tempToken) {
-            // 扫码成功，流转到设置密码
-            clearTimer();
-            setTempToken(poll.tempToken);
-            setScannedUser(poll.user || null);
-            setViewMode('setup_pwd');
-            setSetupPwd('');
-            setSetupPwdConfirm('');
-            setSetupError('');
-          }
-        } catch {
-          // ignore poll error
+    stopQrcodeRef.current = startQrcodeSession({
+      generated: res => {
+        setQrcodeDataUrl(res.qrcodeDataUrl);
+        setQrStatus('waiting');
+        setStatusMsg('请使用哔哩哔哩 App 扫一扫登录');
+      },
+      polled: poll => {
+        if (poll.code === 86101) {
+          setQrStatus('waiting');
+          setStatusMsg('请使用哔哩哔哩 App 扫一扫登录');
+        } else if (poll.code === 86090) {
+          setQrStatus('scanned');
+          setStatusMsg('已扫码！请在手机客户端点击【确认登录】');
+        } else if (poll.code === 86038) {
+          setQrStatus('expired');
+          setStatusMsg('二维码已失效，请点击刷新');
+        } else if (poll.code === 0 && poll.tempToken) {
+          setTempToken(poll.tempToken);
+          setScannedUser(poll.user || null);
+          setViewMode('setup_pwd');
+          setSetupPwd('');
+          setSetupPwdConfirm('');
+          setSetupError('');
         }
-      }, 2000);
-    } catch (err: any) {
-      setQrStatus('expired');
-      setStatusMsg(err.message || '申请二维码失败，请重试');
-    }
-  };
+      },
+      failed: error => {
+        setQrStatus('error');
+        setStatusMsg(errorMessage(error, '二维码请求失败，请重试'));
+      },
+    });
+  }, [stopQrcode]);
 
   useEffect(() => {
     if (!isOpen) {
-      clearTimer();
       setViewMode('auto');
       setUnlockPwd('');
+      setSetupPwd('');
+      setSetupPwdConfirm('');
+      setTempToken('');
+      setScannedUser(null);
       setUnlockError('');
       setSetupError('');
-      return;
-    }
-
-    if (currentView === 'qrcode') {
+      setLogoutError('');
+      setIsSubmittingPwd(false);
+      setIsUnlocking(false);
+      setIsLoggingOut(false);
+    } else if (currentView === 'qrcode') {
       startQrcode();
     }
+    return stopQrcode;
+  }, [isOpen, currentView, startQrcode, stopQrcode]);
 
+  useEffect(() => {
+    if (isOpen) void biliStore.refresh();
     return () => {
-      clearTimer();
+      actions.current.cancel();
+      actionBusy.current = false;
     };
-  }, [isOpen, currentView]);
+  }, [isOpen]);
 
-  if (!isOpen) return null;
+  if (!isOpen || typeof document === 'undefined') return null;
 
   const handleClose = () => {
-    clearTimer();
+    stopQrcode();
+    actions.current.cancel();
+    actionBusy.current = false;
     biliStore.close();
   };
 
@@ -140,16 +144,26 @@ export function BilibiliAuthOverlay() {
       return;
     }
 
+    if (actionBusy.current) return;
+    actionBusy.current = true;
+    const request = actions.current.begin();
     setIsSubmittingPwd(true);
     setSetupError('');
     try {
-      await setupVaultPassword(tempToken, setupPwd, autoUnlockOnBoot);
-      await biliStore.refresh();
+      const { user } = await setupVaultPassword(tempToken, setupPwd, autoUnlockOnBoot, request.signal);
+      if (!request.isCurrent()) return;
+      biliStore.setStatus({ hasVault: true, isUnlocked: true, user, accountSummary: user });
+      setSetupPwd('');
+      setSetupPwdConfirm('');
+      setTempToken('');
       setViewMode('auto');
-    } catch (err: any) {
-      setSetupError(err.message || '加密保存失败');
+    } catch (error) {
+      if (request.isCurrent()) setSetupError(errorMessage(error, '加密保存失败'));
     } finally {
-      setIsSubmittingPwd(false);
+      if (request.isCurrent()) {
+        actionBusy.current = false;
+        setIsSubmittingPwd(false);
+      }
     }
   };
 
@@ -161,34 +175,52 @@ export function BilibiliAuthOverlay() {
       return;
     }
 
+    if (actionBusy.current) return;
+    actionBusy.current = true;
+    const request = actions.current.begin();
     setIsUnlocking(true);
     setUnlockError('');
     try {
-      await unlockVault(unlockPwd, rememberUnlock);
-      await biliStore.refresh();
+      const { user } = await unlockVault(unlockPwd, rememberUnlock, request.signal);
+      if (!request.isCurrent()) return;
+      biliStore.setStatus({ hasVault: true, isUnlocked: true, user, accountSummary: user });
+      setUnlockPwd('');
       setViewMode('auto');
-    } catch (err: any) {
-      setUnlockError(err.message || '密码错误，解锁失败');
+    } catch (error) {
+      if (request.isCurrent()) setUnlockError(errorMessage(error, '密码错误，解锁失败'));
     } finally {
-      setIsUnlocking(false);
+      if (request.isCurrent()) {
+        actionBusy.current = false;
+        setIsUnlocking(false);
+      }
     }
   };
 
   // Logout
   const handleLogout = async () => {
-    if (!confirm('确定要退出登录吗？')) return;
+    if (actionBusy.current || !confirm('确定要退出登录吗？')) return;
+    actionBusy.current = true;
+    const request = actions.current.begin();
+    setIsLoggingOut(true);
+    setLogoutError('');
     try {
-      await logoutVault();
-      await biliStore.refresh();
+      await logoutVault(request.signal);
+      if (!request.isCurrent()) return;
+      biliStore.setStatus({ hasVault: false, isUnlocked: false, user: null, accountSummary: null });
       setViewMode('qrcode');
-    } catch (err: any) {
-      alert(err.message || '退出失败');
+    } catch (error) {
+      if (request.isCurrent()) setLogoutError(errorMessage(error, '退出失败'));
+    } finally {
+      if (request.isCurrent()) {
+        actionBusy.current = false;
+        setIsLoggingOut(false);
+      }
     }
   };
 
-  return (
+  return createPortal(
     <div className="dsh-bili-overlay-mask" onClick={handleClose}>
-      <div className="dsh-bili-modal-card" onClick={(e) => e.stopPropagation()}>
+      <div className="dsh-bili-modal-card" style={{ maxHeight: 'calc(100dvh - 32px)' }} onClick={(e) => e.stopPropagation()}>
         {/* Header */}
         <div className="dsh-bili-modal-header">
           <div className="dsh-bili-modal-title">
@@ -200,7 +232,8 @@ export function BilibiliAuthOverlay() {
         </div>
 
         {/* Body */}
-        <div className="dsh-bili-modal-body">
+        <div className="dsh-bili-modal-body" style={{ overflowY: 'auto', minHeight: 0 }}>
+          {(authError || logoutError) && <div role="alert" className="dsh-bili-error-tip">{logoutError || authError}</div>}
           {/* 1. 已登录面板 (Profile) */}
           {currentView === 'profile' && status.user && (
             <div className="dsh-bili-user-card">
@@ -211,7 +244,7 @@ export function BilibiliAuthOverlay() {
                 className="dsh-bili-avatar-large"
                 referrerPolicy="no-referrer"
               />
-              <div className="dsh-bili-uname" style={{ color: status.user.vipType > 0 ? 'rgba(239, 68, 68, 0.4)' : 'black' }}>{status.user.uname}</div>
+              <div className="dsh-bili-uname">{status.user.uname}</div>
               <div className="dsh-bili-badges">
                 <span className="dsh-bili-tag dsh-bili-tag-level">
                   Lv.{status.user.level}
@@ -237,8 +270,9 @@ export function BilibiliAuthOverlay() {
                   className="dsh-bili-btn dsh-bili-btn-secondary"
                   style={{ color: '#ef4444', borderColor: 'rgba(239, 68, 68, 0.4)' }}
                   onClick={handleLogout}
+                  disabled={isLoggingOut}
                 >
-                  退出
+                  {isLoggingOut ? '正在退出...' : '退出'}
                 </button>
               </div>
             </div>
@@ -256,7 +290,7 @@ export function BilibiliAuthOverlay() {
                   referrerPolicy="no-referrer"
                 />
               )}
-              <div style={{ fontSize: 16, fontWeight: 600, color: '#fff' }}>
+              <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' }}>
                 解锁 {status.accountSummary?.uname || 'B 站'} 账号
               </div>
               <div className="dsh-bili-sub-text" style={{ marginTop: 6, marginBottom: 16 }}>
@@ -265,7 +299,6 @@ export function BilibiliAuthOverlay() {
 
               <form onSubmit={handleUnlock} className="dsh-bili-form">
                 <input
-                  style={ { color: 'black' } }
                   type="password"
                   autoFocus
                   placeholder="输入主密码 (Master Password)"
@@ -409,9 +442,9 @@ export function BilibiliAuthOverlay() {
                       </div>
                     )}
 
-                    {qrStatus === 'expired' && (
+                    {(qrStatus === 'expired' || qrStatus === 'error') && (
                       <div className="dsh-bili-qrcode-mask" onClick={startQrcode}>
-                        <span style={{ fontSize: 13, fontWeight: 'bold' }}>二维码已过期</span>
+                        <span style={{ fontSize: 13, fontWeight: 'bold' }}>{qrStatus === 'expired' ? '二维码已过期' : '二维码请求失败'}</span>
                         <span style={{ fontSize: 11, opacity: 0.8 }}>点击重新生成</span>
                       </div>
                     )}
@@ -441,6 +474,7 @@ export function BilibiliAuthOverlay() {
           )}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

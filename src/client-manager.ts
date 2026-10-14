@@ -1,22 +1,16 @@
-import crypto from 'node:crypto';
-import QRCode from 'qrcode';
-import { BiliClient } from '@seiuna/bilibili-api';
+import type { BiliClient } from '@seiuna/bilibili-api';
 import { VaultService } from './vault-service.js';
+import { getLogger } from './command/logger.js';
+import { createMemoryClient, getCredentials, readNavUser } from './auth/sdk-client.js';
+import { generateQrcode, pollQrcode } from './auth/qrcode-login.js';
+import { TempAuthStore } from './auth/temp-auth-store.js';
+import { SerialTaskQueue } from './storage/serial-task-queue.js';
 import type {
-  BiliUserInfo,
-  DecryptedBiliCredentials,
-  QrcodeGenerateResponse,
-  QrcodePollResponse,
-  VaultAccountSummary,
-  VaultStatusResponse,
+  BiliUserInfo, DecryptedBiliCredentials, QrcodeGenerateResponse,
+  QrcodePollResponse, VaultAccountSummary, VaultStatusResponse,
 } from './types.js';
 
-interface TempAuthRecord {
-  credentials: DecryptedBiliCredentials;
-  account: VaultAccountSummary;
-  user: BiliUserInfo;
-  expiresAt: number;
-}
+const logger = getLogger('BiliClientManager');
 
 export class BilibiliClientManager {
   private static instance: BilibiliClientManager | null = null;
@@ -26,414 +20,161 @@ export class BilibiliClientManager {
   public cachedUser: BiliUserInfo | null = null;
   public accountSummary: VaultAccountSummary | null = null;
 
-  /** 扫码成功后等待设置密码的临时会话 (最多暂存 5 分钟) */
-  private tempAuthTokens = new Map<string, TempAuthRecord>();
-
-  /** 内存中缓存的当前主密码（用于会话生命周期内凭证刷新时静默重加密） */
+  private readonly tempAuthTokens = new TempAuthStore();
+  private readonly mutations = new SerialTaskQueue();
+  private readonly polls = new Map<string, Promise<QrcodePollResponse>>();
   private activeMasterPassword: string | null = null;
+  private sessionRevision = 0;
+  private qrcodeRevision = 0;
 
   private constructor() {
-    // 初始化无参匿名客户端
-    this.client = new BiliClient<any>();
-    // 拦截原本默认的磁盘写入，确保磁盘零明文
-    this.client.config.save = async () => {
-      if (this.isUnlocked && this.activeMasterPassword && this.accountSummary) {
-        try {
-          const creds: DecryptedBiliCredentials = {
-            cookie: this.client.config.data.cookie,
-            refreshToken: this.client.config.data.refreshToken,
-            mid: this.client.config.data.mid,
-          };
-          await VaultService.encryptAndSave(
-            this.activeMasterPassword,
-            creds,
-            this.accountSummary,
-          );
-        } catch {
-          // 静默处理重加密失败
-        }
-      }
+    this.client = createMemoryClient(() => this.sessionRevision);
+    // SDK 的持久化重定向到加密 vault；remember 的独立 key 文件仍是明文解锁材料。
+    // 捕获调用时快照并串行写入；错误必须传给调用者，不能伪装成持久化成功。
+    this.client.config.save = () => {
+      if (!this.isUnlocked || !this.activeMasterPassword || !this.accountSummary) return Promise.resolve();
+      const revision = this.sessionRevision;
+      const password = this.activeMasterPassword;
+      const credentials = getCredentials(this.client);
+      const account = { ...this.accountSummary };
+      return this.mutations.run(async () => {
+        if (revision !== this.sessionRevision || !this.isUnlocked) return;
+        await VaultService.encryptAndSave(password, credentials, account);
+      });
     };
   }
 
   static getInstance(): BilibiliClientManager {
-    if (!this.instance) {
-      this.instance = new BilibiliClientManager();
-    }
-    return this.instance;
+    return this.instance ??= new BilibiliClientManager();
   }
 
-  /** 启动时初始化：检测本地 vault，自动读取存储密码实现免密解密 */
+  /** 启动时使用本地 key 或显式环境密码；不改变用户已经选择的记住密码设置。 */
   async initOnStartup(): Promise<void> {
-    const hasVault = await VaultService.hasVault();
-    if (!hasVault) {
-      return;
-    }
-
-    this.accountSummary = await VaultService.readSummary();
-
-    // 优先从 DSH 仓库存储的 key 或环境变量密码中自动解密
-    const autoPwd = await VaultService.getAutoUnlockPassword();
-    const pwdToUse = autoPwd || process.env.BILIBILI_VAULT_PWD;
-    if (pwdToUse) {
+    return this.mutations.run(async () => {
+      if (!await VaultService.hasVault()) return;
+      this.accountSummary = await VaultService.readSummary();
+      const password = await VaultService.getAutoUnlockPassword() || process.env.BILIBILI_VAULT_PWD;
+      if (!password) return;
       try {
-        await this.unlock(pwdToUse, false);
-        console.log('[dsh-bilibili-plugin] 凭据已自动解密，账号就绪');
-      } catch (err: any) {
-        console.warn('[dsh-bilibili-plugin] 自动解密失败:', err.message);
+        await this.unlockInternal(password);
+        logger.info('凭据已自动解密，账号就绪');
+      } catch {
+        logger.warn('自动解密或凭据验证失败，请手动解锁或重新扫码');
       }
-    }
+    });
   }
 
-  /** 获取当前运行态状态 */
   async getStatus(): Promise<VaultStatusResponse> {
     const hasVault = await VaultService.hasVault();
-    if (!hasVault) {
-      return {
-        hasVault: false,
-        isUnlocked: false,
-        user: null,
-        accountSummary: null,
-      };
-    }
-
-    if (!this.isUnlocked) {
-      if (!this.accountSummary) {
-        this.accountSummary = await VaultService.readSummary();
-      }
-      return {
-        hasVault: true,
-        isUnlocked: false,
-        user: null,
-        accountSummary: this.accountSummary,
-      };
-    }
-
+    if (!hasVault) return { hasVault: false, isUnlocked: false, user: null, accountSummary: null };
+    if (!this.isUnlocked && !this.accountSummary) this.accountSummary = await VaultService.readSummary();
     return {
-      hasVault: true,
-      isUnlocked: true,
-      user: this.cachedUser,
-      accountSummary: this.accountSummary,
+      hasVault: true, isUnlocked: this.isUnlocked,
+      user: this.isUnlocked ? this.cachedUser : null, accountSummary: this.accountSummary,
     };
   }
 
-  /** 动态解密凭据并注入内存客户端 */
-  async unlock(password: string, remember: boolean = true): Promise<BiliUserInfo> {
+  /** 候选凭据先在隔离的内存客户端验证，成功后才提交状态和记住密码设置。 */
+  unlock(password: string, remember = true): Promise<BiliUserInfo> {
+    return this.mutations.run(() => this.unlockInternal(password, remember));
+  }
+
+  private async unlockInternal(password: string, remember?: boolean): Promise<BiliUserInfo> {
     const credentials = await VaultService.decrypt(password);
-    this.activeMasterPassword = password;
-
-    if (remember) {
-      await VaultService.saveAutoUnlockPassword(password);
-    }
-
-    // 注入内存
-    this.client.config.data.cookie = credentials.cookie;
-    this.client.config.data.refreshToken = credentials.refreshToken;
-    if (credentials.mid) {
-      this.client.config.data.mid = credentials.mid;
-    }
-
-    // 验证并拉取用户信息
-    const user = await this.refreshNavUser();
-    this.isUnlocked = true;
-    this.cachedUser = user;
-    this.accountSummary = {
-      mid: user.mid,
-      uname: user.uname,
-      face: user.face,
-    };
-
+    const candidate = createMemoryClient();
+    // 验证阶段不触发 SDK 的自动 refresh 写请求；过期凭据交由 UI 重新扫码。
+    candidate.config.data.cookie = credentials.cookie;
+    candidate.config.data.mid = credentials.mid;
+    const user = await readNavUser(candidate);
+    if (remember === true) await VaultService.saveAutoUnlockPassword(password);
+    if (remember === false) await VaultService.removeAutoUnlockPassword();
+    this.activate({ ...credentials, cookie: candidate.config.data.cookie, mid: user.mid }, user, password);
     return user;
   }
 
-  /** 申请生成登录二维码 (Data URL + Terminal) */
-  async generateQrcode(): Promise<QrcodeGenerateResponse> {
-    const res = await fetch(
-      'https://passport.bilibili.com/x/passport-login/web/qrcode/generate',
-      { method: 'GET' },
-    );
-
-    if (!res.ok) {
-      throw new Error(`申请二维码失败: HTTP ${res.status}`);
-    }
-
-    const json = (await res.json()) as {
-      code: number;
-      message: string;
-      data: { qrcode_key: string; url: string };
-    };
-
-    if (json.code !== 0) {
-      throw new Error(`申请二维码失败: ${json.message}`);
-    }
-
-    const { qrcode_key, url } = json.data;
-    const qrcodeDataUrl = await QRCode.toDataURL(url, {
-      margin: 1,
-      width: 256,
-      color: { dark: '#000000', light: '#ffffff' },
-    });
-
-    return {
-      qrcodeKey: qrcode_key,
-      url,
-      qrcodeDataUrl,
-    };
+  generateQrcode(): Promise<QrcodeGenerateResponse> {
+    return generateQrcode();
   }
 
-  /** 轮询二维码扫码状态 */
-  async pollQrcode(qrcodeKey: string): Promise<QrcodePollResponse> {
-    const res = await fetch(
-      `https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key=${encodeURIComponent(qrcodeKey)}`,
-      { method: 'GET' },
-    );
-
-    if (!res.ok) {
-      return {
-        code: -1,
-        status: 'error',
-        message: `轮询二维码网络异常: HTTP ${res.status}`,
-      };
+  /** 同一二维码的并发轮询合并，全部在途轮询有界，退出后旧结果不能重新激活。 */
+  pollQrcode(qrcodeKey: string): Promise<QrcodePollResponse> {
+    const existing = this.polls.get(qrcodeKey);
+    if (existing) return existing;
+    if (this.polls.size >= 16) {
+      return Promise.resolve({ code: -1, status: 'error', message: '二维码轮询过多，请稍后重试' });
     }
-
-    const pollSetCookie = this.extractSetCookies(res.headers);
-    const json = (await res.json()) as {
-      code: number;
-      message: string;
-      data?: {
-        url: string;
-        refresh_token: string;
-        timestamp: number;
-        code: number;
-        message: string;
-      };
-    };
-
-    const statusSubCode = json.data?.code;
-
-    // 86101: 未扫码
-    if (statusSubCode === 86101) {
-      return {
-        code: 86101,
-        status: 'waiting',
-        message: '等待手机端扫码...',
-      };
-    }
-
-    // 86090: 已扫码未确认
-    if (statusSubCode === 86090) {
-      return {
-        code: 86090,
-        status: 'scanned',
-        message: '已扫码，请在手机客户端点击【确认登录】',
-      };
-    }
-
-    // 86038: 二维码已失效
-    if (statusSubCode === 86038) {
-      return {
-        code: 86038,
-        status: 'expired',
-        message: '二维码已失效，请重新生成',
-      };
-    }
-
-    // 0: 登录成功
-    if (statusSubCode === 0 && json.data) {
-      const cookieHeader = Array.isArray(pollSetCookie)
-        ? pollSetCookie.join('; ')
-        : pollSetCookie;
-
-      const cookiePairs = this.parseCookiePairs(cookieHeader);
-      const cookieStr = Object.entries(cookiePairs)
-        .map(([k, v]) => `${k}=${v}`)
-        .join('; ');
-
-      const midStr = cookiePairs['DedeUserID'];
-      const mid = midStr ? Number(midStr) : undefined;
-
-      // 提取用户信息
-      let userInfo: BiliUserInfo = {
-        mid: mid ?? 0,
-        uname: 'B站用户',
-        face: '',
-        level: 0,
-        coins: 0,
-        vipType: 0,
-      };
-
-      try {
-        const navRes = await fetch('https://api.bilibili.com/x/web-interface/nav', {
-          headers: { Cookie: cookieStr },
-        });
-        const navJson = (await navRes.json()) as any;
-        if (navJson.code === 0 && navJson.data) {
-          const d = navJson.data;
-          userInfo = {
-            mid: d.mid,
-            uname: d.uname,
-            face: d.face,
-            level: d.level_info?.current_level ?? 0,
-            coins: d.money ?? 0,
-            vipType: d.vipType ?? 0,
-          };
-        }
-      } catch {
-        // 忽略 nav 获取异常
+    const revision = this.qrcodeRevision;
+    const operation = pollQrcode(qrcodeKey).then(({ response, record }) => {
+      if (revision !== this.qrcodeRevision) {
+        return { code: -1, status: 'error' as const, message: '登录操作已取消，请重新扫码' };
       }
-
-      // 生成一次性 tempAuthToken 待设置密码
-      const tempToken = crypto.randomBytes(24).toString('hex');
-      const accountSummary: VaultAccountSummary = {
-        mid: userInfo.mid,
-        uname: userInfo.uname,
-        face: userInfo.face,
-      };
-
-      this.tempAuthTokens.set(tempToken, {
-        credentials: {
-          cookie: cookieStr,
-          refreshToken: json.data.refresh_token,
-          mid,
-        },
-        account: accountSummary,
-        user: userInfo,
-        expiresAt: Date.now() + 5 * 60 * 1000,
-      });
-
-      return {
-        code: 0,
-        status: 'success',
-        message: '扫码成功！请设置本地保护密码完成凭据加密',
-        tempToken,
-        user: userInfo,
-      };
-    }
-
-    return {
-      code: statusSubCode ?? -1,
-      status: 'error',
-      message: json.data?.message || json.message || '未知状态',
-    };
+      if (record) response.tempToken = this.tempAuthTokens.add(record);
+      return response;
+    }).finally(() => { this.polls.delete(qrcodeKey); });
+    this.polls.set(qrcodeKey, operation);
+    return operation;
   }
 
-  /** 扫码成功后设置主密码，加密落盘并即时激活会话 */
-  async setupPassword(
-    tempToken: string,
-    password: string,
-    remember: boolean = true,
-  ): Promise<BiliUserInfo> {
-    const record = this.tempAuthTokens.get(tempToken);
-    if (!record || Date.now() > record.expiresAt) {
-      throw new Error('临时认证凭据已失效或不存在，请重新扫码');
-    }
-
-    if (!password || password.trim().length < 1) {
-      throw new Error('密码不能为空');
-    }
-
-    // 1. 加密落盘
-    await VaultService.encryptAndSave(
-      password,
-      record.credentials,
-      record.account,
-    );
-
-    // 2. 保存免密解密 key
-    if (remember) {
-      await VaultService.saveAutoUnlockPassword(password);
-    }
-
-    // 3. 注入内存
-    this.activeMasterPassword = password;
-    this.client.config.data.cookie = record.credentials.cookie;
-    this.client.config.data.refreshToken = record.credentials.refreshToken;
-    this.client.config.data.mid = record.credentials.mid;
-
-    this.isUnlocked = true;
-    this.cachedUser = record.user;
-    this.accountSummary = record.account;
-
-    // 清理临时凭据
-    this.tempAuthTokens.delete(tempToken);
-
-    return record.user;
+  /** 设置密码与消费 token 串行执行，失败可重试，成功的 token 不能重复使用。 */
+  setupPassword(tempToken: string, password: string, remember = true): Promise<BiliUserInfo> {
+    return this.mutations.run(async () => {
+      const record = this.tempAuthTokens.get(tempToken);
+      if (!record) throw new Error('临时认证凭据已失效或不存在，请重新扫码');
+      if (!password.trim()) throw new Error('密码不能为空');
+      // 先撤销旧自动解锁材料。两个独立文件不构成跨文件原子事务：失败时不激活内存。
+      await VaultService.removeAutoUnlockPassword();
+      await VaultService.encryptAndSave(password, record.credentials, record.account);
+      try {
+        if (remember) await VaultService.saveAutoUnlockPassword(password);
+      } catch (error) {
+        // vault 已替换；旧会话不能继续把旧密码/账号写回新 vault。token 保留供重试。
+        this.clearSession();
+        throw error;
+      }
+      this.activate(record.credentials, record.user, password);
+      return record.user;
+    });
   }
 
-  /** 退出登录并抹除 DSH 加密凭据仓库 */
-  async logout(): Promise<void> {
-    await VaultService.removeVault();
+  logout(): Promise<void> {
+    // 即使磁盘删除失败，也立刻丢弃临时授权；运行态仍在串行队列中安全清理。
+    this.qrcodeRevision++;
+    this.tempAuthTokens.clear();
+    return this.mutations.run(async () => {
+      this.clearSession();
+      await VaultService.removeVault();
+    });
+  }
+
+  private clearSession(): void {
+    this.sessionRevision++;
     this.isUnlocked = false;
     this.cachedUser = null;
     this.accountSummary = null;
     this.activeMasterPassword = null;
-    this.client.config.data.cookie = '';
-    this.client.config.data.refreshToken = '';
-    this.client.config.data.mid = undefined;
+    this.client.config.data = { cookie: '', refreshToken: '' };
   }
 
-  /** 刷新并获取当前登录用户的完整状态 */
-  private async refreshNavUser(): Promise<BiliUserInfo> {
-    const res = await this.client.request<{
-      code: number;
-      message: string;
-      data: any;
-    }>('https://api.bilibili.com/x/web-interface/nav');
-
-    if (res.code !== 0 || !res.data?.isLogin) {
-      throw new Error('当前凭据已失效，需要重新扫码登录');
-    }
-
-    const d = res.data;
-    return {
-      mid: d.mid,
-      uname: d.uname,
-      face: d.face,
-      level: d.level_info?.current_level ?? 0,
-      coins: d.money ?? 0,
-      vipType: d.vipType ?? 0,
-    };
+  private activate(credentials: DecryptedBiliCredentials, user: BiliUserInfo, password: string): void {
+    this.sessionRevision++;
+    this.qrcodeRevision++;
+    this.tempAuthTokens.clear();
+    this.client.config.data = { ...credentials };
+    this.activeMasterPassword = password;
+    this.cachedUser = user;
+    this.accountSummary = { mid: user.mid, uname: user.uname, face: user.face };
+    this.isUnlocked = true;
   }
 
-  /** 获取客户端实例（公开/只读） */
+  /** 公共 client 对象身份稳定，现有 SDK API、实体和测试引用继续可用。 */
   getClient(): BiliClient<any> {
     return this.client;
   }
 
-  /** 要求当前必须处于已解锁（登录）状态，否则抛错 */
   requireAuthedClient(): BiliClient<any> {
     if (!this.isUnlocked) {
-      throw new Error(
-        'Bilibili 凭据尚未解锁！请在 DSH 界面点击顶部药丸输入主密码进行动态解密。',
-      );
+      throw new Error('Bilibili 凭据尚未解锁！请在 DSH 界面点击顶部药丸输入主密码进行动态解密。');
     }
     return this.client;
-  }
-
-  // ---- 辅助工具方法 ----
-
-  private extractSetCookies(headers: Headers): string | string[] {
-    if (typeof (headers as any).getSetCookie === 'function') {
-      const list = (headers as any).getSetCookie();
-      if (list.length > 0) return list;
-    }
-    return headers.get('set-cookie') ?? '';
-  }
-
-  private parseCookiePairs(cookieStr: string): Record<string, string> {
-    const result: Record<string, string> = {};
-    if (!cookieStr) return result;
-    const parts = cookieStr.split(';');
-    for (const part of parts) {
-      const [rawKey, ...rawVal] = part.trim().split('=');
-      if (rawKey) {
-        const val = rawVal.join('=');
-        // 过滤掉 path, expires, domain 等属性
-        if (!/^(path|expires|domain|samesite|httponly|secure)$/i.test(rawKey)) {
-          result[rawKey] = val;
-        }
-      }
-    }
-    return result;
   }
 }

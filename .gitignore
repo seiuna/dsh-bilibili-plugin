@@ -14,3 +14,5 @@ Thumbs.db
 .env.*.local
 coverage/
 .turbo/
+# 本地真实账户 profile（含 cookie / refreshToken），禁止入库
+profiles/

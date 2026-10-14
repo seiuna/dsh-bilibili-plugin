@@ -15,6 +15,13 @@ export default defineConfig([
     fixedExtension: false,
     dts: true,
     clean: true,
+    deps: {
+      alwaysBundle: [
+        '@seiuna/bilibili-api',
+        'qrcode',
+      ],
+      onlyBundle: false,
+    },
   },
   // 2. Client bundle (CJS wrapped for DSH __ModuleLoader__)
   {
