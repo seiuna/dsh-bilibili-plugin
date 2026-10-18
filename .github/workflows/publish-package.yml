@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   publish:
@@ -26,9 +27,12 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
           registry-url: 'https://registry.npmjs.org'
+
+      - name: Set up npm for trusted publishing
+        run: npm install --global npm@11
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -49,5 +53,3 @@ jobs:
 
       - name: Publish to npm
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
