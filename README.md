@@ -189,7 +189,7 @@ git push origin main --follow-tags
 
 然后在 GitHub 发布对应 tag 的 Release。tag 去掉 `v` 后，要与 `package.json` 中的版本一致。
 
-仓库 CI 会在推送到 `main` 或提交 PR 时运行检查。npm 发布由 Release 的 `published` 事件触发，需要在 Actions secrets 中配置 `NPM_TOKEN`。[发布工作流](./.github/workflows/publish-package.yml)已指定 npm 官方源。
+仓库 CI 会在推送到 `main` 或提交 PR 时运行检查。npm 发布由 Release 的 `published` 事件触发，使用 Trusted Publishing，无需配置 `NPM_TOKEN`。首次手动发布后，在 npm 包设置的 Trusted Publisher 中选择 GitHub Actions，填写用户 `seiuna`、仓库 `dsh-bilibili-plugin`、工作流文件名 `publish-package.yml`，环境名留空，并允许直接发布。[发布工作流](./.github/workflows/publish-package.yml)已指定 npm 官方源。
 
 ## 遇到问题
 
