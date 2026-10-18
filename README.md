@@ -1,4 +1,4 @@
-# dsh-bilibili-plugin
+# @seiuna/dsh-bilibili-plugin
 
 一个给 DeepSeek Harness（DSH） 用的 B站插件。
 
@@ -24,22 +24,22 @@
 
 ```powershell
 cd ~/.dsh/profiles/web
-pnpm add dsh-bilibili-plugin
+pnpm add @seiuna/dsh-bilibili-plugin
 ```
 
-然后打开同目录的 `package.json`，在 `dsh.profile.bundles` 里加上 `dsh-bilibili-plugin`。原来的配置保留，只补这一项：
+然后打开同目录的 `package.json`，在 `dsh.profile.bundles` 里加上 `@seiuna/dsh-bilibili-plugin`。原来的配置保留，只补这一项：
 
 ```json
 {
   "dependencies": {
-    "dsh-bilibili-plugin": "^0.1.0"
+    "@seiuna/dsh-bilibili-plugin": "^1.0.4"
   },
   "dsh": {
     "profile": {
       "bundles": [
         "@deepseek-ai/dsh-base",
         "@deepseek-ai/dsh-web-app",
-        "dsh-bilibili-plugin"
+        "@seiuna/dsh-bilibili-plugin"
       ]
     }
   }
@@ -55,10 +55,10 @@ pnpm add dsh-bilibili-plugin
 升级时，在同一个 profile 目录运行：
 
 ```powershell
-pnpm add dsh-bilibili-plugin@latest
+pnpm add @seiuna/dsh-bilibili-plugin@latest
 ```
 
-卸载时运行 `pnpm remove dsh-bilibili-plugin`，再从 `bundles` 中删掉插件。两种操作完成后都需要重启 DSH。
+卸载时运行 `pnpm remove @seiuna/dsh-bilibili-plugin`，再从 `bundles` 中删掉插件。两种操作完成后都需要重启 DSH。
 
 ## 登录和使用
 
@@ -147,7 +147,7 @@ pnpm run build
 ```json
 {
   "dependencies": {
-    "dsh-bilibili-plugin": "link:D:/project/dsh-bilibili-plugin"
+    "@seiuna/dsh-bilibili-plugin": "link:D:/project/dsh-bilibili-plugin"
   }
 }
 ```
@@ -157,7 +157,7 @@ pnpm run build
 ```yaml
 - insert:
     - id: bilibili
-      name: dsh-bilibili-plugin
+      name: '@seiuna/dsh-bilibili-plugin'
 ```
 
 `pnpm run dev` 可以监听源码并重新构建。修改后端后需要重建并重启 DSH；只改前端时，重建后刷新页面即可。宿主是否自动重载，取决于当前 DSH 环境。
