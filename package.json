@@ -1,6 +1,6 @@
 {
-  "name": "@seiuna/dsh-bilibili-plugin",
-  "version": "1.0.4",
+  "name": "dsh-bilibili-plugin",
+  "version": "1.0.5",
   "description": "Bilibili plugin for DeepSeek Harness (DSH)",
   "type": "module",
   "main": "lib/index.js",
@@ -24,6 +24,7 @@
     "client": {
       "inject": [
         "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
         "@deepseek-ai/dsh-client-ui-slots"
       ],
       "platform": "web"
