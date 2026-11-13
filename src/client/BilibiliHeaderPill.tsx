@@ -242,7 +242,7 @@ export function BilibiliHeaderPill() {
       setSearchResult(null);
       setPanelError('');
       setPanelNotice('');
-    }, 250);
+    }, 350);
   };
 
   const handleToggle = async (key: 'enableReply' | 'enableAt' | 'enableWhitelist' | 'autoLikeOnReply') => {

@@ -548,6 +548,14 @@ export const styles = `
   box-sizing: border-box;
   max-width: calc(100vw - 20px);
 }
+.dsh-bili-portal-wrap::before {
+  content: '';
+  position: absolute;
+  top: -12px;
+  left: 0;
+  right: 0;
+  height: 12px;
+}
 
 .dsh-bili-portal-wrap .dsh-bili-dropdown {
   position: static;
