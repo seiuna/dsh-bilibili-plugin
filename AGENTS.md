@@ -15,7 +15,7 @@
 - `src/tools.ts` 为兼容入口；`src/tools/` 按业务域拆分工具与写操作确认，完整映射见 `docs/TOOLS_API.md`。
 - `src/network/bilibili-image.ts`：头像与评论图片的受限下载边界（host、协议、redirect、大小、超时）。
 - `src/types.ts`：共享数据类型。新增业务字段优先声明明确类型，不依赖索引签名逃避检查。
-- `docs/TOOLS_API.md`、`docs/REFACTOR_1.1.3.md`：工具/API 映射与重构验证报告；`docs/issues/` 保存已提交上游 issue 的脱敏草稿。
+- `docs/TOOLS_API.md`：工具与 API 的映射说明。
 - `skills/bilibili-comment-context/SKILL.md`：结构化评论输入的识别规则；插件入口注册，发布包包含 `skills/`。
 - `test/`：离线测试及显式启用的真实 profile 预览。
 - `lib/`：构建产物，不直接修改。
