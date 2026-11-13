@@ -53,7 +53,7 @@
     "dev": "tsdown --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check": "pnpm run typecheck && pnpm test && pnpm run build",
+    "check": "pnpm run typecheck && pnpm run build && pnpm test",
     "prepublishOnly": "pnpm run check"
   },
   "keywords": [
